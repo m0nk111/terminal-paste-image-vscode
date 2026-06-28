@@ -1,6 +1,6 @@
 import * as vscode from 'vscode';
-import * as fs from 'fs';
 import * as path from 'path';
+import * as os from 'os';
 import { exec } from 'child_process';
 import { promisify } from 'util';
 
@@ -30,16 +30,19 @@ async function pasteImageFromClipboard() {
     const autoGitIgnore = config.get<boolean>('autoGitIgnore', true);
     const maxImages = config.get<number>('maxImages', 10);
 
-    const workspaceRoot = workspaceFolders[0].uri.fsPath;
-    const imagesDir = path.join(workspaceRoot, folderName);
-    
-    if (!fs.existsSync(imagesDir)) {
-        fs.mkdirSync(imagesDir, { recursive: true });
+    const workspaceRootUri = workspaceFolders[0].uri;
+    const imagesDirUri = vscode.Uri.joinPath(workspaceRootUri, folderName);
+
+    // Create images directory if it doesn't exist
+    try {
+        await vscode.workspace.fs.stat(imagesDirUri);
+    } catch {
+        await vscode.workspace.fs.createDirectory(imagesDirUri);
     }
 
     const timestamp = new Date().toISOString().replace(/[:.]/g, '-').split('.')[0];
     const imageName = `pasted-image-${timestamp}.png`;
-    const imagePath = path.join(imagesDir, imageName);
+    const imageUri = vscode.Uri.joinPath(imagesDirUri, imageName);
     const relativePath = `${folderName}/${imageName}`;
 
     const hasImage = await checkClipboardForImage();
@@ -48,18 +51,18 @@ async function pasteImageFromClipboard() {
         return;
     }
 
-    await saveClipboardImage(imagePath);
-    
+    await saveClipboardImage(imageUri);
+
     // Handle .gitignore auto-update
     if (autoGitIgnore) {
-        await updateGitIgnore(workspaceRoot, folderName);
+        await updateGitIgnore(workspaceRootUri, folderName);
     }
-    
+
     // Clean up old images
-    await cleanupOldImages(imagesDir, maxImages);
-    
+    await cleanupOldImages(imagesDirUri, maxImages);
+
     await insertPathInTerminal(relativePath);
-    
+
     vscode.window.showInformationMessage(`Image saved and path inserted: ${relativePath}`);
 }
 
@@ -80,7 +83,7 @@ async function getPowerShellPath(): Promise<string> {
         '/mnt/c/Windows/SysWOW64/WindowsPowerShell/v1.0/powershell.exe',
         'powershell.exe' // Fallback to PATH
     ];
-    
+
     for (const path of possiblePaths) {
         try {
             await execAsync(`test -f "${path}" || which "${path}"`);
@@ -89,7 +92,7 @@ async function getPowerShellPath(): Promise<string> {
             continue;
         }
     }
-    
+
     throw new Error('PowerShell.exe not found in WSL');
 }
 
@@ -98,7 +101,7 @@ async function checkClipboardForImage(): Promise<boolean> {
         const platform = process.platform;
         const wsl = await isWSL();
         console.log(`Platform detected: ${platform}, WSL: ${wsl}`);
-        
+
         let command: string;
 
         if (platform === 'linux' && wsl) {
@@ -122,14 +125,14 @@ async function checkClipboardForImage(): Promise<boolean> {
         }
 
         console.log(`Executing command: ${command}`);
-        
+
         const isInWSL = platform === 'linux' && wsl;
-        
+
         try {
             const { stdout, stderr } = await execAsync(command);
             console.log(`Command stdout: ${stdout}`);
             console.log(`Command stderr: ${stderr}`);
-            
+
             let hasImage = false;
             if (platform === 'win32' || isInWSL) {
                 // PowerShell returns image properties when an image exists
@@ -139,7 +142,7 @@ async function checkClipboardForImage(): Promise<boolean> {
             } else if (platform === 'darwin') {
                 hasImage = true; // If grep succeeds, it found the image
             }
-            
+
             console.log(`Has image result: ${hasImage}`);
             return hasImage;
         } catch (cmdError: any) {
@@ -163,50 +166,71 @@ async function checkClipboardForImage(): Promise<boolean> {
     }
 }
 
-async function saveClipboardImage(imagePath: string): Promise<void> {
+async function saveClipboardImage(targetUri: vscode.Uri): Promise<void> {
     const platform = process.platform;
     const wsl = await isWSL();
+
+    // Save the image to a local temp file first, then copy it to the target URI
+    // This is necessary because the extension runs on the local (UI) side where
+    // clipboard access works, but the target path may be on a remote filesystem.
+    const tempDir = os.tmpdir();
+    const tempFileName = `cp-img-${Date.now()}.png`;
+    const tempPath = path.join(tempDir, tempFileName);
+
     let command: string;
 
     if (platform === 'linux' && wsl) {
         // In WSL, we need to convert the WSL path to Windows path and use PowerShell
-        const { stdout: winPath } = await execAsync(`wslpath -w "${imagePath}"`);
+        const { stdout: winPath } = await execAsync(`wslpath -w "${tempPath}"`);
         const cleanWinPath = winPath.trim().replace(/\\/g, '\\\\');
         const psPath = await getPowerShellPath();
         command = `"${psPath}" -command "Add-Type -AssemblyName System.Windows.Forms; \\$img = [Windows.Forms.Clipboard]::GetImage(); if (\\$img -ne \\$null) { \\$img.Save('${cleanWinPath}'); }"`;
     } else {
         switch (platform) {
             case 'win32':
-                command = `powershell -command "Add-Type -AssemblyName System.Windows.Forms; $img = [Windows.Forms.Clipboard]::GetImage(); if ($img -ne $null) { $img.Save('${imagePath}'); }"`;
+                command = `powershell -command "Add-Type -AssemblyName System.Windows.Forms; $img = [Windows.Forms.Clipboard]::GetImage(); if ($img -ne $null) { $img.Save('${tempPath}'); }"`;
                 break;
             case 'darwin':
-                command = `osascript -e "set the clipboard to (read (POSIX file \"${imagePath}\") as «class PNGf»)" && pngpaste "${imagePath}"`;
+                command = `pngpaste "${tempPath}"`;
                 break;
             case 'linux':
-                command = `xclip -selection clipboard -t image/png -o > "${imagePath}"`;
+                command = `xclip -selection clipboard -t image/png -o > "${tempPath}"`;
                 break;
             default:
                 throw new Error(`Unsupported platform: ${platform}`);
         }
     }
 
-    console.log(`Saving image with command: ${command}`);
+    console.log(`Saving image to temp path with command: ${command}`);
     await execAsync(command);
+
+    // Read the temp file and write it to the target URI via VS Code's file system API
+    // This works for both local and remote workspaces
+    const tempUri = vscode.Uri.file(tempPath);
+    const imageData = await vscode.workspace.fs.readFile(tempUri);
+    await vscode.workspace.fs.writeFile(targetUri, imageData);
+
+    // Clean up temp file
+    try {
+        await vscode.workspace.fs.delete(tempUri);
+    } catch {
+        // Ignore cleanup errors
+    }
 }
 
-async function updateGitIgnore(workspaceRoot: string, folderName: string): Promise<void> {
-    const gitignorePath = path.join(workspaceRoot, '.gitignore');
-    
+async function updateGitIgnore(workspaceRootUri: vscode.Uri, folderName: string): Promise<void> {
+    const gitignoreUri = vscode.Uri.joinPath(workspaceRootUri, '.gitignore');
+
     try {
-        // Check if .gitignore exists
-        if (!fs.existsSync(gitignorePath)) {
+        let gitignoreContent = '';
+        try {
+            const content = await vscode.workspace.fs.readFile(gitignoreUri);
+            gitignoreContent = Buffer.from(content).toString('utf8');
+        } catch {
             console.log('No .gitignore file found, skipping auto-update');
             return;
         }
 
-        // Read .gitignore content
-        const gitignoreContent = fs.readFileSync(gitignorePath, 'utf8');
-        
         // Check if the folder is already in .gitignore
         const folderPattern = folderName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); // Escape special regex chars
         const patterns = [
@@ -214,15 +238,15 @@ async function updateGitIgnore(workspaceRoot: string, folderName: string): Promi
             new RegExp(`^${folderPattern}/\\*$`, 'm'),   // With wildcard
             new RegExp(`^\\*\\*/${folderPattern}/?$`, 'm'), // Recursive match
         ];
-        
+
         const alreadyIgnored = patterns.some(pattern => pattern.test(gitignoreContent));
-        
+
         if (!alreadyIgnored) {
             // Add the folder to .gitignore
             const newLine = gitignoreContent.endsWith('\n') ? '' : '\n';
             const updatedContent = `${gitignoreContent}${newLine}\n# Terminal Paste Image folder\n/${folderName}\n`;
-            
-            fs.writeFileSync(gitignorePath, updatedContent, 'utf8');
+
+            await vscode.workspace.fs.writeFile(gitignoreUri, Buffer.from(updatedContent, 'utf8'));
             console.log(`Added ${folderName}/ to .gitignore`);
         } else {
             console.log(`${folderName} is already in .gitignore`);
@@ -233,41 +257,47 @@ async function updateGitIgnore(workspaceRoot: string, folderName: string): Promi
     }
 }
 
-async function cleanupOldImages(imagesDir: string, maxImages: number): Promise<void> {
+async function cleanupOldImages(imagesDirUri: vscode.Uri, maxImages: number): Promise<void> {
     try {
-        if (!fs.existsSync(imagesDir)) {
+        let entries: [string, vscode.FileType][];
+        try {
+            entries = await vscode.workspace.fs.readDirectory(imagesDirUri);
+        } catch {
             return;
         }
 
-        // Read all files in the images directory
-        const files = fs.readdirSync(imagesDir);
-        
         // Filter for image files (assuming they follow the pasted-image-*.png pattern)
-        const imageFiles = files.filter(file => 
-            file.startsWith('pasted-image-') && file.endsWith('.png')
+        const imageFiles = entries.filter(([name, type]) =>
+            type === vscode.FileType.File &&
+            name.startsWith('pasted-image-') &&
+            name.endsWith('.png')
         );
 
         if (imageFiles.length <= maxImages) {
             return; // No cleanup needed
         }
 
-        // Get file stats and sort by creation time (newest first)
-        const fileStats = imageFiles.map(file => {
-            const filePath = path.join(imagesDir, file);
-            const stats = fs.statSync(filePath);
-            return {
-                name: file,
-                path: filePath,
-                mtime: stats.mtime
-            };
-        }).sort((a, b) => b.mtime.getTime() - a.mtime.getTime());
+        // Get file stats and sort by modification time (newest first)
+        const fileStats = await Promise.all(
+            imageFiles.map(async ([name]) => {
+                const fileUri = vscode.Uri.joinPath(imagesDirUri, name);
+                const stat = await vscode.workspace.fs.stat(fileUri);
+                return {
+                    name,
+                    uri: fileUri,
+                    mtime: stat.mtime
+                };
+            })
+        );
+
+        fileStats.sort((a, b) => b.mtime - a.mtime);
 
         // Keep only the most recent maxImages files, delete the rest
         const filesToDelete = fileStats.slice(maxImages);
-        
+
         for (const fileInfo of filesToDelete) {
             try {
-                fs.unlinkSync(fileInfo.path);
+                await vscode.workspace.fs.delete(fileInfo.uri);
                 console.log(`Deleted old image: ${fileInfo.name}`);
             } catch (deleteError) {
                 console.error(`Failed to delete ${fileInfo.name}:`, deleteError);
